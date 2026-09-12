@@ -7,47 +7,35 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-13
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Build HookLogger.dylib
+      - name: List Xcode versions
+        run: ls /Applications | grep Xcode
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.2.app/Contents/Developer || sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Show SDK info
         run: |
-          set -x
-          echo "=== SDK Path ==="
-          xcrun --sdk iphoneos --show-sdk-path || echo "iOS SDK not found, trying alternative"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version || echo "No iOS SDK"
+          xcrun --sdk macosx --show-sdk-version
 
-          # 尝试使用 iphoneos SDK，如果失败则用 macosx
-          if xcrun --sdk iphoneos --show-sdk-path &>/dev/null; then
-            SDK="iphoneos"
-          else
-            SDK="macosx"
-            echo "WARNING: Using macOS SDK instead of iOS (simulator build)"
-          fi
-
-          echo "=== Building with SDK: $SDK ==="
-          xcrun --sdk "$SDK" clang \
-            -dynamiclib \
+      - name: Build dylib
+        run: |
+          clang -dynamiclib \
             -arch arm64 \
-            -fobjc-arc \
             -framework Foundation \
-            -miphoneos-version-min=12.0 \
-            -install_name @rpath/HookLogger.framework/HookLogger \
             -o HookLogger.dylib \
-            HookLogger.m \
-            2>&1 | tee build.log || {
-              echo "=== BUILD FAILED ==="
-              cat build.log
-              exit 1
-            }
-
-          echo "=== Build Success ==="
+            HookLogger.m
           file HookLogger.dylib
-          ls -lh HookLogger.dylib
-          otool -L HookLogger.dylib || true
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: HookLogger-dylib
           path: HookLogger.dylib
