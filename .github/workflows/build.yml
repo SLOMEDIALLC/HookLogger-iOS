@@ -1,0 +1,31 @@
+name: Build HookLogger iOS dylib
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build HookLogger.dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang \
+            -dynamiclib \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -framework Foundation \
+            -install_name @rpath/HookLogger.framework/HookLogger \
+            -o HookLogger.dylib \
+            HookLogger.m
+          echo "Build OK: $(file HookLogger.dylib)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: HookLogger-dylib
+          path: HookLogger.dylib
