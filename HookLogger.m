@@ -1,8 +1,6 @@
 // HookLogger.m - 编译: clang -dynamiclib -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -framework Foundation -o HookLogger.dylib HookLogger.m
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <dlfcn.h>
-#import <mach/mach.h>
 
 // ── 日志上报 ─────────────────────────────────────────────────────────────
 static void sendToServer(NSDictionary *info) {
@@ -23,22 +21,24 @@ static void sendToServer(NSDictionary *info) {
 
 // ── 获取调用栈（返回偏移量）────────────────────────────────────────────────
 static NSString *getCallStack(void) {
-    void *frames[16];
-    int  n = backtrace(frames, 16);
+    NSArray *syms = [NSThread callStackSymbols];
     NSMutableArray *arr = [NSMutableArray array];
-
-    // 尝试找 SDWebuiopser 模块基址
-    Dl_info dlinfo;
-    for (int i = 0; i < n; i++) {
-        if (dladdr(frames[i], &dlinfo) && dlinfo.dli_fname &&
-            strstr(dlinfo.dli_fname, "SDWebuiopser")) {
-            uintptr_t base   = (uintptr_t)dlinfo.dli_fbase;
-            uintptr_t pc     = (uintptr_t)frames[i];
-            uintptr_t offset = pc - base;
-            [arr addObject:[NSString stringWithFormat:@"SDWebuiopser+0x%lx", offset]];
-        } else {
-            [arr addObject:[NSString stringWithFormat:@"%p", frames[i]]];
+    for (NSString *s in syms) {
+        // 格式: "1   SDWebuiopser  0x000000010234abcd 0x102340000 + 43981"
+        if ([s containsString:@"SDWebuiopser"]) {
+            NSScanner *scanner = [NSScanner scannerWithString:s];
+            unsigned long long addr = 0, base = 0;
+            [scanner scanUpToString:@"0x" intoString:nil];
+            [scanner scanHexLongLong:&addr];
+            [scanner scanUpToString:@"0x" intoString:nil];
+            [scanner scanHexLongLong:&base];
+            if (addr && base) {
+                unsigned long long offset = addr - base;
+                [arr addObject:[NSString stringWithFormat:@"SDWebuiopser+0x%llx", offset]];
+                continue;
+            }
         }
+        [arr addObject:s];
     }
     return [arr componentsJoinedByString:@" | "];
 }
