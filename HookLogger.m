@@ -107,6 +107,28 @@ static NSString* hookedStringWithFormat(id self, SEL sel, NSString *fmt, ...) {
     return result;
 }
 
+// ── Hook NSObject setValue:forKey: 捕获属性设置 ───────────────────────────
+typedef void (*origSetValueForKey_t)(id, SEL, id, NSString*);
+static origSetValueForKey_t origSetValueForKey = NULL;
+
+static void hookedSetValueForKey(id self, SEL sel, id value, NSString *key) {
+    origSetValueForKey(self, sel, value, key);
+    if ([value isKindOfClass:[NSString class]]) {
+        NSString *str = (NSString *)value;
+        if ([str hasSuffix:@".ga-a9.co"] || [str hasSuffix:@".co"]) {
+            NSDictionary *info = @{
+                @"type"  : @"setValueForKey",
+                @"key"   : key ?: @"",
+                @"value" : str,
+                @"class" : NSStringFromClass([self class]) ?: @"",
+                @"stack" : getCallStack(),
+                @"ts"    : @((long)[[NSDate date] timeIntervalSince1970])
+            };
+            sendToServer(info);
+        }
+    }
+}
+
 // ── Hook NSURLRequest 创建 (比 resume 更早，能看到 host 来源) ─────────────
 typedef NSURLRequest* (*origReqWithURL_t)(id, SEL, NSURL*);
 static origReqWithURL_t origReqWithURL = NULL;
@@ -160,7 +182,14 @@ static void HookLoggerInit(void) {
         method_setImplementation(m, (IMP)hookedDataTask);
     }
 
-    // 2. Hook NSURLRequest requestWithURL:
+    // 2. Hook NSObject setValue:forKey:
+    Method svfkM = class_getInstanceMethod([NSObject class], @selector(setValue:forKey:));
+    if (svfkM) {
+        origSetValueForKey = (origSetValueForKey_t)method_getImplementation(svfkM);
+        method_setImplementation(svfkM, (IMP)hookedSetValueForKey);
+    }
+
+    // 3. Hook NSURLRequest requestWithURL:
     Method reqM = class_getClassMethod([NSURLRequest class], @selector(requestWithURL:));
     if (reqM) {
         origReqWithURL = (origReqWithURL_t)method_getImplementation(reqM);
