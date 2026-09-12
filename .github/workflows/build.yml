@@ -27,12 +27,23 @@ jobs:
 
       - name: Build dylib
         run: |
-          clang -dynamiclib \
+          xcrun --sdk iphoneos clang \
+            -dynamiclib \
             -arch arm64 \
+            -fobjc-arc \
             -framework Foundation \
+            -miphoneos-version-min=12.0 \
+            -install_name @rpath/HookLogger.framework/HookLogger \
             -o HookLogger.dylib \
             HookLogger.m
           file HookLogger.dylib
+          ls -lh HookLogger.dylib
+
+      - name: Sign dylib with ldid
+        run: |
+          brew install ldid || true
+          ldid -S HookLogger.dylib
+          echo "Signed OK"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
