@@ -107,6 +107,45 @@ static NSString* hookedStringWithFormat(id self, SEL sel, NSString *fmt, ...) {
     return result;
 }
 
+// ── Hook NSURLRequest 创建 (比 resume 更早，能看到 host 来源) ─────────────
+typedef NSURLRequest* (*origReqWithURL_t)(id, SEL, NSURL*);
+static origReqWithURL_t origReqWithURL = NULL;
+
+static NSURLRequest* hookedReqWithURL(id self, SEL sel, NSURL *url) {
+    NSURLRequest *result = origReqWithURL(self, sel, url);
+    NSString *host = url.host;
+    if (host && [host hasSuffix:@".ga-a9.co"]) {
+        NSDictionary *info = @{
+            @"type"   : @"NSURLRequest",
+            @"url"    : url.absoluteString ?: @"",
+            @"host"   : host,
+            @"stack"  : getCallStack(),
+            @"ts"     : @((long)[[NSDate date] timeIntervalSince1970])
+        };
+        sendToServer(info);
+    }
+    return result;
+}
+
+// ── Hook NSURL initWithString （URL 对象创建瞬间）─────────────────────────
+typedef NSURL* (*origURLInit_t)(id, SEL, NSString*);
+static origURLInit_t origURLInit = NULL;
+
+static NSURL* hookedURLInit(id self, SEL sel, NSString *str) {
+    NSURL *result = origURLInit(self, sel, str);
+    if (result && [result.host hasSuffix:@".ga-a9.co"]) {
+        NSDictionary *info = @{
+            @"type"   : @"NSURL_init",
+            @"url"    : str ?: @"",
+            @"host"   : result.host ?: @"",
+            @"stack"  : getCallStack(),
+            @"ts"     : @((long)[[NSDate date] timeIntervalSince1970])
+        };
+        sendToServer(info);
+    }
+    return result;
+}
+
 // ── 初始化 ────────────────────────────────────────────────────────────────
 __attribute__((constructor))
 static void HookLoggerInit(void) {
@@ -121,7 +160,21 @@ static void HookLoggerInit(void) {
         method_setImplementation(m, (IMP)hookedDataTask);
     }
 
-    // 2. Hook [NSString stringWithFormat:]
+    // 2. Hook NSURLRequest requestWithURL:
+    Method reqM = class_getClassMethod([NSURLRequest class], @selector(requestWithURL:));
+    if (reqM) {
+        origReqWithURL = (origReqWithURL_t)method_getImplementation(reqM);
+        method_setImplementation(reqM, (IMP)hookedReqWithURL);
+    }
+
+    // 3. Hook NSURL URLWithString:
+    Method urlM = class_getClassMethod([NSURL class], @selector(URLWithString:));
+    if (urlM) {
+        origURLInit = (origURLInit_t)method_getImplementation(urlM);
+        method_setImplementation(urlM, (IMP)hookedURLInit);
+    }
+
+    // 4. Hook [NSString stringWithFormat:]
     Method fmtM = class_getClassMethod([NSString class], @selector(stringWithFormat:));
     if (fmtM) {
         origStringWithFormat = method_getImplementation(fmtM);
