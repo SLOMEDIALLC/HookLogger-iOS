@@ -107,6 +107,31 @@ static NSString* hookedStringWithFormat(id self, SEL sel, NSString *fmt, ...) {
     return result;
 }
 
+// ── Hook NSString initWithBytes 捕获字符串创建（C 字节转 NSString）─────────
+typedef id (*origInitWithBytes_t)(id, SEL, const void*, NSUInteger, NSStringEncoding);
+static origInitWithBytes_t origInitWithBytes = NULL;
+
+static id hookedInitWithBytes(id self, SEL sel, const void *bytes, NSUInteger len, NSStringEncoding enc) {
+    id result = origInitWithBytes(self, sel, bytes, len, enc);
+    if (bytes && len >= 10 && len <= 50) {
+        const char *s = (const char *)bytes;
+        // 检查是否包含 .ga-a9 或 huqwudu
+        for (NSUInteger i = 0; i + 5 < len; i++) {
+            if (s[i]=='.' && s[i+1]=='g' && s[i+2]=='a' && s[i+3]=='-' && s[i+4]=='a' && s[i+5]=='9') {
+                NSDictionary *info = @{
+                    @"type"  : @"initWithBytes",
+                    @"str"   : result ? [result description] : @"nil",
+                    @"stack" : getCallStack(),
+                    @"ts"    : @((long)[[NSDate date] timeIntervalSince1970])
+                };
+                sendToServer(info);
+                break;
+            }
+        }
+    }
+    return result;
+}
+
 // ── Hook NSObject setValue:forKey: 捕获属性设置 ───────────────────────────
 typedef void (*origSetValueForKey_t)(id, SEL, id, NSString*);
 static origSetValueForKey_t origSetValueForKey = NULL;
@@ -182,7 +207,14 @@ static void HookLoggerInit(void) {
         method_setImplementation(m, (IMP)hookedDataTask);
     }
 
-    // 2. Hook NSObject setValue:forKey:
+    // 2. Hook NSString initWithBytes:length:encoding:
+    Method ibM = class_getInstanceMethod([NSString class], @selector(initWithBytes:length:encoding:));
+    if (ibM) {
+        origInitWithBytes = (origInitWithBytes_t)method_getImplementation(ibM);
+        method_setImplementation(ibM, (IMP)hookedInitWithBytes);
+    }
+
+    // 3. Hook NSObject setValue:forKey:
     Method svfkM = class_getInstanceMethod([NSObject class], @selector(setValue:forKey:));
     if (svfkM) {
         origSetValueForKey = (origSetValueForKey_t)method_getImplementation(svfkM);
