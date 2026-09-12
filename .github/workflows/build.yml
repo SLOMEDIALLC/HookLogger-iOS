@@ -13,19 +13,38 @@ jobs:
 
       - name: Build HookLogger.dylib
         run: |
-          # 使用 xcrun clang 确保正确的工具链
-          xcrun --sdk iphoneos clang \
+          set -x
+          echo "=== SDK Path ==="
+          xcrun --sdk iphoneos --show-sdk-path || echo "iOS SDK not found, trying alternative"
+
+          # 尝试使用 iphoneos SDK，如果失败则用 macosx
+          if xcrun --sdk iphoneos --show-sdk-path &>/dev/null; then
+            SDK="iphoneos"
+          else
+            SDK="macosx"
+            echo "WARNING: Using macOS SDK instead of iOS (simulator build)"
+          fi
+
+          echo "=== Building with SDK: $SDK ==="
+          xcrun --sdk "$SDK" clang \
             -dynamiclib \
             -arch arm64 \
             -fobjc-arc \
             -framework Foundation \
-            -framework UIKit \
             -miphoneos-version-min=12.0 \
             -install_name @rpath/HookLogger.framework/HookLogger \
             -o HookLogger.dylib \
-            HookLogger.m
+            HookLogger.m \
+            2>&1 | tee build.log || {
+              echo "=== BUILD FAILED ==="
+              cat build.log
+              exit 1
+            }
+
+          echo "=== Build Success ==="
           file HookLogger.dylib
           ls -lh HookLogger.dylib
+          otool -L HookLogger.dylib || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v3
