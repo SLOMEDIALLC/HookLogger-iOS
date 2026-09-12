@@ -13,16 +13,19 @@ jobs:
 
       - name: Build HookLogger.dylib
         run: |
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          clang \
+          # 使用 xcrun clang 确保正确的工具链
+          xcrun --sdk iphoneos clang \
             -dynamiclib \
             -arch arm64 \
-            -isysroot "$SDK" \
+            -fobjc-arc \
             -framework Foundation \
+            -framework UIKit \
+            -miphoneos-version-min=12.0 \
             -install_name @rpath/HookLogger.framework/HookLogger \
             -o HookLogger.dylib \
             HookLogger.m
-          echo "Build OK: $(file HookLogger.dylib)"
+          file HookLogger.dylib
+          ls -lh HookLogger.dylib
 
       - name: Upload artifact
         uses: actions/upload-artifact@v3
