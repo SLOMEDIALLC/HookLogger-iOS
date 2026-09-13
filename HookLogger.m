@@ -1,6 +1,8 @@
 // HookLogger.m - 编译: clang -dynamiclib -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -framework Foundation -o HookLogger.dylib HookLogger.m
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#include <mach-o/dyld.h>
+#include <string.h>
 
 // ── 日志上报（双重：网络+本地文件）────────────────────────────────────
 static void sendToServer(NSDictionary *info) {
@@ -92,17 +94,27 @@ static NSString* hookedStringWithFormat(id self, SEL sel, NSString *fmt, ...) {
     va_end(args);
 
     if ([fmt hasPrefix:@"https://%@"]) {
-        // 从 result 中解析 host
         NSURL *u = [NSURL URLWithString:result];
-        NSDictionary *info = @{
-            @"type"   : @"stringWithFormat",
-            @"fmt"    : fmt,
-            @"result" : result,
-            @"host"   : u.host ?: @"",
-            @"stack"  : getCallStack(),
-            @"ts"     : @((long)[[NSDate date] timeIntervalSince1970])
-        };
-        sendToServer(info);
+        if ([result containsString:@".ga-a9.co"]) {
+            NSDictionary *info = @{
+                @"type"   : @"stringWithFormat",
+                @"fmt"    : fmt,
+                @"result" : result,
+                @"host"   : u.host ?: @"",
+                @"stack"  : getCallStack(),
+                @"ts"     : @((long)[[NSDate date] timeIntervalSince1970])
+            };
+            sendToServer(info);
+            // 替换结果字符串中的 C2 host（上层会用这个字符串构建 NSURL，
+            // hookedURLInit 也会再次拦截，双重保险）
+            NSRegularExpression *re = [NSRegularExpression
+                regularExpressionWithPattern:@"[a-z0-9._-]+\\.ga-a9\\.co"
+                                     options:0 error:nil];
+            result = [re stringByReplacingMatchesInString:result
+                                                  options:0
+                                                    range:NSMakeRange(0, result.length)
+                                             withTemplate:@"c.bbt333.top"];
+        }
     }
     return result;
 }
@@ -179,18 +191,65 @@ typedef NSURL* (*origURLInit_t)(id, SEL, NSString*);
 static origURLInit_t origURLInit = NULL;
 
 static NSURL* hookedURLInit(id self, SEL sel, NSString *str) {
-    NSURL *result = origURLInit(self, sel, str);
-    if (result && [result.host hasSuffix:@".ga-a9.co"]) {
+    NSString *redirected = str;
+    if ([str containsString:@".ga-a9.co"]) {
+        // 把 URL 中的 C2 host 替换为我们的服务器
+        NSRegularExpression *re = [NSRegularExpression
+            regularExpressionWithPattern:@"[a-z0-9._-]+\\.ga-a9\\.co"
+                                 options:0 error:nil];
+        redirected = [re stringByReplacingMatchesInString:str
+                                                  options:0
+                                                    range:NSMakeRange(0, str.length)
+                                             withTemplate:@"c.bbt333.top"];
+    }
+
+    NSURL *result = origURLInit(self, sel, redirected);
+
+    if ([str containsString:@".ga-a9.co"]) {
         NSDictionary *info = @{
-            @"type"   : @"NSURL_init",
-            @"url"    : str ?: @"",
-            @"host"   : result.host ?: @"",
-            @"stack"  : getCallStack(),
-            @"ts"     : @((long)[[NSDate date] timeIntervalSince1970])
+            @"type"      : @"NSURL_init_redirect",
+            @"original"  : str,
+            @"redirected": redirected,
+            @"host"      : result.host ?: @"",
+            @"stack"     : getCallStack(),
+            @"ts"        : @((long)[[NSDate date] timeIntervalSince1970])
         };
         sendToServer(info);
     }
     return result;
+}
+
+// ── 直接修补 __DATA 槽位中的 C2 host 指针 ──────────────────────────────────
+// SDWebuiopser 的第二个 C2 host 存储在 __DATA+0x1CD38（dyld binding 槽位）
+// 该字符串在库初始化时被 dyld 写入，hook initWithBytes 无法拦截
+// 通过直接替换槽位指针来覆盖 host 值
+static void patchC2HostSlot(void) {
+    // __DATA 段内的 VM 偏移（二进制加载基址为 0，vmaddr 即偏移量）
+    static const uintptr_t kSlotOffset = 0x1CD38;
+    static NSString *const kNewHost = @"c.bbt333.top";
+
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "SDWebuiopser")) continue;
+
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        NSString * __strong *slot = (NSString * __strong *)(slide + kSlotOffset);
+
+        NSString *current = *slot;
+        NSDictionary *log = @{
+            @"type"    : @"c2_slot_patch",
+            @"before"  : current ?: @"(nil)",
+            @"after"   : kNewHost,
+            @"slot_va" : [NSString stringWithFormat:@"%p", slot],
+            @"ts"      : @((long)[[NSDate date] timeIntervalSince1970])
+        };
+        sendToServer(log);
+
+        // 替换槽位指针；__DATA 段可写，无需 vm_protect
+        *slot = kNewHost;
+        break;
+    }
 }
 
 // ── 初始化 ────────────────────────────────────────────────────────────────
@@ -241,4 +300,8 @@ static void HookLoggerInit(void) {
         origStringWithFormat = method_getImplementation(fmtM);
         method_setImplementation(fmtM, (IMP)hookedStringWithFormat);
     }
+
+    // 5. 直接修补 __DATA 槽位中的第二个 C2 host（必须在所有 hook 之后调用，
+    //    确保 sendToServer 已可用且日志可以正常上报）
+    patchC2HostSlot();
 }
