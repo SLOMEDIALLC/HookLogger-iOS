@@ -1,71 +1,64 @@
 import SwiftUI
-import WebKit
 
 struct RootView: View {
-    @State private var splashDone  = false
-    @State private var webReady    = false
-
-    // WKWebView 提前创建，splash 期间就在后台加载 H5
+    @State private var splashDone   = false
+    @State private var networkReady = false   // 传给 SplashView 控制进度
     @StateObject private var webStore = WebStore()
 
     var body: some View {
         ZStack {
-            // H5 始终在底层渲染（splash 期间在后台静默加载）
+            // H5 在底层，splash 结束才显示
             WebView(store: webStore)
                 .ignoresSafeArea()
                 .opacity(splashDone ? 1 : 0)
 
-            // Splash 覆盖在上面，10秒后淡出
             if !splashDone {
-                SplashView {
+                SplashView(onFinish: {
                     withAnimation(.easeIn(duration: 0.4)) {
                         splashDone = true
                     }
-                }
+                }, networkReady: $networkReady)
                 .transition(.opacity)
+                .zIndex(1)
             }
         }
         .onAppear {
-            // 触发 H5 加载（WebStore 在 @StateObject 初始化时已创建 WKWebView）
-            webStore.load(appURL)
+            probeNetwork()
         }
     }
 
     var appURL: String {
-        let raw = Bundle.main.infoDictionary?["H5BaseURL"] as? String ?? "about:blank"
-        if raw.hasPrefix("http") { return raw }
-        return "https://" + raw
-    }
-}
-
-// 持有 WKWebView 实例，保证 splash 期间就在加载
-class WebStore: NSObject, ObservableObject, WKNavigationDelegate {
-    private static let pool = WKProcessPool()   // 独立进程池
-
-    let webView: WKWebView
-
-    override init() {
-        let config = WKWebViewConfiguration()
-        config.processPool = WebStore.pool       // SDWebuiopser hook 不到
-        config.allowsInlineMediaPlayback = true
-        config.mediaTypesRequiringUserActionForPlayback = []
-        webView = WKWebView(frame: .zero, configuration: config)
-        super.init()
-        webView.navigationDelegate = self
-        webView.scrollView.bounces = false
+        let raw = Bundle.main.infoDictionary?["H5BaseURL"] as? String ?? ""
+        if raw.isEmpty { return "about:blank" }
+        return raw.hasPrefix("http") ? raw : "https://" + raw
     }
 
-    func load(_ urlStr: String) {
-        guard let url = URL(string: urlStr) else { return }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 30
-        webView.load(req)
-    }
+    /// 每 1 秒用系统 URLSession 探测网络（SDWebuiopser hook 期间会失败/超时）
+    /// 一旦拿到有效 HTTP 响应：
+    ///   1. 通知 SplashView 冲满进度条（约 0.8 秒动画）
+    ///   2. 让 WKWebView（独立进程池）开始加载 H5
+    func probeNetwork() {
+        let url = appURL
+        guard let probeURL = URL(string: url) else { return }
+        var loaded = false
 
-    // 加载失败 3 秒后重试
-    func webView(_ wv: WKWebView, didFailProvisionalNavigation _: WKNavigation!, withError _: Error) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            wv.reload()
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { t in
+            guard !loaded else { t.invalidate(); return }
+            var req = URLRequest(url: probeURL)
+            req.timeoutInterval = 2      // 短超时
+            URLSession.shared.dataTask(with: req) { _, resp, _ in
+                guard !loaded else { return }
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                guard code > 0 else { return }   // 0 = 超时/失败，继续等
+                loaded = true
+                t.invalidate()
+                DispatchQueue.main.async {
+                    networkReady = true            // → SplashView 冲满进度
+                    webStore.load(url)             // → WKWebView 开始加载
+                }
+            }.resume()
         }
+
+        // 无兜底：没网就一直等，进度条卡在 90%，有网了自动继续
     }
 }
