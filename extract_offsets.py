@@ -1,72 +1,60 @@
 #!/usr/bin/env python3
 """
-iOS 26 / xnu-12377 - 精确计算 struct proc/ucred/filedesc 偏移
-用 pycparser 或手动计算
+iOS 26 / xnu-12377 - 确认 p_ucred 新位置 + 计算关键偏移
 """
 import subprocess, sys, os, re
 
 XNU = 'xnu'
 
-# pip install pycparser
-subprocess.run([sys.executable, '-m', 'pip', 'install', 'pycparser', '-q'], check=False)
-
-proc_h = open(f'{XNU}/bsd/sys/proc_internal.h').read()
+proc_h    = open(f'{XNU}/bsd/sys/proc_internal.h').read()
 proc_ro_h = open(f'{XNU}/bsd/sys/proc_ro.h').read() if os.path.exists(f'{XNU}/bsd/sys/proc_ro.h') else ''
-ucred_h = open(f'{XNU}/bsd/sys/ucred.h').read()
-filedesc_h = open(f'{XNU}/bsd/sys/filedesc.h').read()
-task_h = open(f'{XNU}/osfmk/kern/task.h').read()
+ucred_h   = open(f'{XNU}/bsd/sys/ucred.h').read()
+filedesc_h= open(f'{XNU}/bsd/sys/filedesc.h').read()
+task_h    = open(f'{XNU}/osfmk/kern/task.h').read()
 
-# 找 struct proc 定义起点
-def find_struct(content, name):
-    """找 struct NAME { ... } 的完整定义"""
-    # 找 struct proc {
-    pattern = rf'\bstruct\s+{name}\s*\{{'
-    m = re.search(pattern, content)
-    if not m:
-        return '', 0
-    start = m.start()
-    # 找配对的 }
-    depth = 0
-    i = m.end() - 1  # 从 { 开始
+def find_struct_body(content, name):
+    m = re.search(rf'\bstruct\s+{name}\s*\{{', content)
+    if not m: return ''
+    depth, i = 0, m.end()-1
     while i < len(content):
-        if content[i] == '{': depth += 1
-        elif content[i] == '}':
-            depth -= 1
-            if depth == 0:
-                return content[start:i+1], start
-        i += 1
-    return '', 0
+        if content[i]=='{': depth+=1
+        elif content[i]=='}':
+            depth-=1
+            if depth==0: return content[m.start():i+1]
+        i+=1
+    return ''
 
-# 输出 struct proc 完整定义
-struct_proc, _ = find_struct(proc_h, 'proc')
-struct_proc_ro, _ = find_struct(proc_ro_h, 'proc_ro')
-struct_ucred, _ = find_struct(ucred_h, 'ucred')
-struct_fd, _ = find_struct(filedesc_h, 'filedesc')
-struct_task, _ = find_struct(task_h, 'task')
+print("=== proc_ro.h (full content) ===")
+print(proc_ro_h[:6000])
 
-print("=== struct proc (xnu-12377) ===")
-print(struct_proc[:5000] if struct_proc else "NOT FOUND")
+print("\n=== struct task - first 200 lines ===")
+for i,l in enumerate(task_h.split('\n')[:200], 1):
+    print(f"{i:4}: {l}")
 
-print("\n=== struct ucred (xnu-12377) ===")
-print(struct_ucred[:2000] if struct_ucred else "NOT FOUND")
+# 找 p_ucred 在哪
+print("\n=== p_ucred in proc_internal.h ===")
+for l in proc_h.split('\n'):
+    if 'ucred' in l.lower():
+        print(f"  {l.strip()[:100]}")
 
-print("\n=== struct filedesc (xnu-12377) ===")
-print(struct_fd[:2000] if struct_fd else "NOT FOUND")
+print("\n=== ucred in proc_ro.h ===")
+for l in proc_ro_h.split('\n'):
+    if 'ucred' in l.lower() or 'cred' in l.lower():
+        print(f"  {l.strip()[:100]}")
 
-print("\n=== task.h - bsd_info ===")
+print("\n=== bsd_info in task.h ===")
 for l in task_h.split('\n'):
     if 'bsd_info' in l or 'bsd_task' in l:
         print(f"  {l.strip()[:100]}")
 
-result = '\n'.join([
-    "=== struct proc ===", struct_proc,
-    "\n=== struct proc_ro ===", struct_proc_ro[:2000],
-    "\n=== struct ucred ===", struct_ucred,
-    "\n=== struct filedesc ===", struct_fd,
-    "\n=== task bsd_info ===",
-    '\n'.join(l for l in task_h.split('\n') if 'bsd_info' in l or 'bsd_task' in l),
-])
-
 with open('ios26_offsets.txt', 'w') as f:
-    f.write(result)
+    f.write("=== proc_ro.h ===\n")
+    f.write(proc_ro_h)
+    f.write("\n\n=== task.h first 200 lines ===\n")
+    f.write('\n'.join(task_h.split('\n')[:200]))
+    f.write("\n\n=== p_ucred references ===\n")
+    f.write('\n'.join(l for l in proc_h.split('\n') if 'ucred' in l.lower()))
+    f.write("\n\n=== struct filedesc ===\n")
+    f.write(find_struct_body(filedesc_h, 'filedesc'))
+
 print("\nSaved ios26_offsets.txt")
