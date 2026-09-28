@@ -1,49 +1,72 @@
 #!/usr/bin/env python3
 """
-iOS 26 / xnu-12377 - 直接从 GitHub 下载 XNU 源码，精确提取关键结构体偏移
-策略：克隆 XNU，用 clang -cc1 -ast-dump json 解析结构体
+iOS 26 / xnu-12377 - 精确计算 struct proc/ucred/filedesc 偏移
+用 pycparser 或手动计算
 """
-import subprocess, sys, os, re, json
+import subprocess, sys, os, re
 
 XNU = 'xnu'
 
-# ─── 写最小化 C 文件，只 include 关键内容 ───────────────────────────────────
-# 我们从 XNU 头文件里手动抽取 proc/ucred/filedesc 的字段
-# 先看完整 proc_internal.h 前 300 行
+# pip install pycparser
+subprocess.run([sys.executable, '-m', 'pip', 'install', 'pycparser', '-q'], check=False)
+
 proc_h = open(f'{XNU}/bsd/sys/proc_internal.h').read()
+proc_ro_h = open(f'{XNU}/bsd/sys/proc_ro.h').read() if os.path.exists(f'{XNU}/bsd/sys/proc_ro.h') else ''
 ucred_h = open(f'{XNU}/bsd/sys/ucred.h').read()
 filedesc_h = open(f'{XNU}/bsd/sys/filedesc.h').read()
 task_h = open(f'{XNU}/osfmk/kern/task.h').read()
-file_h = open(f'{XNU}/bsd/sys/file_internal.h').read() if os.path.exists(f'{XNU}/bsd/sys/file_internal.h') else ''
 
-print("=== proc_internal.h (lines 1-150) ===")
-lines = proc_h.split('\n')
-for i, l in enumerate(lines[:150], 1):
-    print(f"{i:4}: {l}")
+# 找 struct proc 定义起点
+def find_struct(content, name):
+    """找 struct NAME { ... } 的完整定义"""
+    # 找 struct proc {
+    pattern = rf'\bstruct\s+{name}\s*\{{'
+    m = re.search(pattern, content)
+    if not m:
+        return '', 0
+    start = m.start()
+    # 找配对的 }
+    depth = 0
+    i = m.end() - 1  # 从 { 开始
+    while i < len(content):
+        if content[i] == '{': depth += 1
+        elif content[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return content[start:i+1], start
+        i += 1
+    return '', 0
 
-print("\n=== task.h - bsd_info field ===")
-for i, l in enumerate(task_h.split('\n'), 1):
-    if 'bsd_info' in l or 'bsd_task_info' in l:
-        print(f"{i:4}: {l}")
+# 输出 struct proc 完整定义
+struct_proc, _ = find_struct(proc_h, 'proc')
+struct_proc_ro, _ = find_struct(proc_ro_h, 'proc_ro')
+struct_ucred, _ = find_struct(ucred_h, 'ucred')
+struct_fd, _ = find_struct(filedesc_h, 'filedesc')
+struct_task, _ = find_struct(task_h, 'task')
 
-print("\n=== ucred.h (lines 1-100) ===")
-ucred_lines = ucred_h.split('\n')
-for i, l in enumerate(ucred_lines[:100], 1):
-    print(f"{i:4}: {l}")
+print("=== struct proc (xnu-12377) ===")
+print(struct_proc[:5000] if struct_proc else "NOT FOUND")
 
-print("\n=== filedesc.h (lines 1-80) ===")
-fd_lines = filedesc_h.split('\n')
-for i, l in enumerate(fd_lines[:80], 1):
-    print(f"{i:4}: {l}")
+print("\n=== struct ucred (xnu-12377) ===")
+print(struct_ucred[:2000] if struct_ucred else "NOT FOUND")
 
-# 保存完整内容
+print("\n=== struct filedesc (xnu-12377) ===")
+print(struct_fd[:2000] if struct_fd else "NOT FOUND")
+
+print("\n=== task.h - bsd_info ===")
+for l in task_h.split('\n'):
+    if 'bsd_info' in l or 'bsd_task' in l:
+        print(f"  {l.strip()[:100]}")
+
+result = '\n'.join([
+    "=== struct proc ===", struct_proc,
+    "\n=== struct proc_ro ===", struct_proc_ro[:2000],
+    "\n=== struct ucred ===", struct_ucred,
+    "\n=== struct filedesc ===", struct_fd,
+    "\n=== task bsd_info ===",
+    '\n'.join(l for l in task_h.split('\n') if 'bsd_info' in l or 'bsd_task' in l),
+])
+
 with open('ios26_offsets.txt', 'w') as f:
-    f.write("=== XNU-12377 struct analysis ===\n\n")
-    f.write("--- proc_internal.h first 300 lines ---\n")
-    f.write('\n'.join(lines[:300]))
-    f.write("\n\n--- ucred.h first 150 lines ---\n")
-    f.write('\n'.join(ucred_lines[:150]))
-    f.write("\n\n--- filedesc.h first 150 lines ---\n")
-    f.write('\n'.join(fd_lines[:150]))
-
-print("\nSaved to ios26_offsets.txt")
+    f.write(result)
+print("\nSaved ios26_offsets.txt")
