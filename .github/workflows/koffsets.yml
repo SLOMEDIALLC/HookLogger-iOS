@@ -7,13 +7,11 @@ jobs:
   extract:
     runs-on: macos-latest
     steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
     - name: Clone XNU xnu-12377.121.6
       run: git clone --depth=1 --branch xnu-12377.121.6 https://github.com/apple-oss-distributions/xnu.git xnu
-
-    - name: Upload extractor script
-      run: cat extract_offsets.py | python3
-      env:
-        SCRIPT: "run"
 
     - name: Run offset extractor
       run: python3 extract_offsets.py
