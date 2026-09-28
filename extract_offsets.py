@@ -1,158 +1,166 @@
 #!/usr/bin/env python3
 """
 iOS 26 / xnu-12377 kernel struct offset extractor
+Approach: Read XNU headers from GitHub, parse struct layouts with Python
+ARM64 ABI: pointers=8B, uint32=4B, uint64=8B, int=4B
 """
-import subprocess, sys, os, re
+import urllib.request, json, re, sys
 
-XNU = 'xnu'
+BASE = 'https://raw.githubusercontent.com/apple-oss-distributions/xnu/xnu-12377.121.6'
+COMP = 'https://raw.githubusercontent.com/apple-oss-distributions/xnu/xnu-10002.81.5'  # iOS 15
 
-# 先创建缺失的 stub headers
-stubs = {
-    f'{XNU}/BUILD/obj/EXPORT_HDRS/mach_assert.h': '#pragma once\n',
-    f'{XNU}/EXTERNAL_HEADERS/mach_assert.h': '#pragma once\n',
-    f'{XNU}/osfmk/mach_assert.h': '#pragma once\n',
+def fetch(path, tag='xnu-12377.121.6'):
+    url = f'https://raw.githubusercontent.com/apple-oss-distributions/xnu/{tag}/{path}'
+    try:
+        with urllib.request.urlopen(url, timeout=20) as r:
+            return r.read().decode(errors='replace')
+    except:
+        return ''
+
+# ARM64 type sizes/alignments
+TYPE_INFO = {
+    'int': (4, 4), 'unsigned int': (4, 4), 'uint32_t': (4, 4), 'u_int32_t': (4, 4),
+    'long': (8, 8), 'unsigned long': (8, 8),
+    'uint64_t': (8, 8), 'u_int64_t': (8, 8), 'int64_t': (8, 8),
+    'uint16_t': (2, 2), 'u_int16_t': (2, 2), 'int16_t': (2, 2),
+    'uint8_t': (1, 1), 'u_int8_t': (1, 1), 'int8_t': (1, 1), 'char': (1, 1),
+    'bool': (1, 1), 'boolean_t': (4, 4),
+    'pid_t': (4, 4), 'uid_t': (4, 4), 'gid_t': (4, 4), 'mode_t': (2, 2),
+    'short': (2, 2), 'unsigned short': (2, 2),
+    'size_t': (8, 8), 'ssize_t': (8, 8), 'off_t': (8, 8),
+    # Pointers / pointer-sized
+    'pointer': (8, 8),
 }
-for path, content in stubs.items():
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
-        f.write(content)
 
-# 极简 C 文件 - 让 XNU 自己 typedef，我们不重定义
-MINI_C = r"""
-#define KERNEL 1
-#define KERNEL_PRIVATE 1
-#define BSD_KERNEL_PRIVATE 1
-#define XNU_KERNEL_PRIVATE 1
-#define MACH_KERNEL_PRIVATE 1
-#define __APPLE_API_PRIVATE 1
-#define PRIVATE 1
-#define MACH_ASSERT 0
-#define MACH_LDEBUG 0
-#define CONFIG_DTRACE 0
-#define MONOTONIC 0
-#define LOCK_STATS 0
-#define __arm64__ 1
-#define __LP64__ 1
-#define ARM_PGSHIFT 14
-#define CONFIG_THREAD_GROUPS 1
-#define CONFIG_PERVASIVE_COMPACTION 0
-#define CONFIG_REQUIRES_U32_MSGID 0
-#define CONFIG_XNUPOST 0
-#define CONFIG_KCDATA_INIT 0
+def align_up(val, align):
+    return (val + align - 1) & ~(align - 1)
 
-/* Let XNU define boolean_t as it wants */
-#include <stddef.h>
-#include <stdint.h>
-#include <stdio.h>
-
-#include "bsd/sys/proc_internal.h"
-#include "bsd/sys/ucred.h"
-#include "bsd/sys/filedesc.h"
-#include "bsd/sys/file_internal.h"
-
-void dummy(void) {
-    (void)sizeof(struct proc);
-    (void)sizeof(struct ucred);
-    (void)sizeof(struct filedesc);
-}
-"""
-
-with open(f'{XNU}/mini.c', 'w') as f:
-    f.write(MINI_C)
-
-CFLAGS = [
-    'clang',
-    '-target', 'arm64-apple-macos14.0',
-    f'-I{XNU}', f'-I{XNU}/bsd', f'-I{XNU}/osfmk',
-    f'-I{XNU}/libkern', f'-I{XNU}/EXTERNAL_HEADERS',
-    f'-I{XNU}/BUILD/obj/EXPORT_HDRS',
-    '-DKERNEL=1', '-DKERNEL_PRIVATE=1', '-DBSD_KERNEL_PRIVATE=1',
-    '-DXNU_KERNEL_PRIVATE=1', '-DMACH_KERNEL_PRIVATE=1',
-    '-DPRIVATE=1', '-D__APPLE_API_PRIVATE=1',
-    '-DMACH_ASSERT=0', '-DCONFIG_DTRACE=0', '-D__arm64__=1', '-D__LP64__=1',
-    '-Wno-everything',
-    '-Xclang', '-fdump-record-layouts',
-    '-fsyntax-only',
-    f'{XNU}/mini.c'
-]
-
-result = subprocess.run(CFLAGS, capture_output=True, text=True, timeout=120)
-dump = result.stderr + result.stdout
-
-def parse_layout(dump, struct_name):
+def parse_struct_simple(struct_def):
+    """
+    Simplified struct layout: look for patterns like
+      field_type field_name;
+    Handles pointers (*) and arrays ([N])
+    Returns dict {field_name: byte_offset}
+    """
     offsets = {}
-    in_struct = False
-    struct_size = 0
-    for line in dump.split('\n'):
-        if f'*** Dumping AST Record Layout' in line and struct_name in line:
-            in_struct = True
+    offset = 0
+
+    # Remove comments
+    struct_def = re.sub(r'/\*.*?\*/', '', struct_def, flags=re.DOTALL)
+    struct_def = re.sub(r'//.*$', '', struct_def, flags=re.MULTILINE)
+
+    # Parse each field
+    for line in struct_def.split(';'):
+        line = line.strip()
+        if not line or '{' in line or '}' in line or '#' in line:
             continue
-        if in_struct:
-            if line.startswith('*** Dumping') or (line.strip() == '' and in_struct):
-                in_struct = False
-                continue
-            # size line
-            m_size = re.match(r'\s*sizeof=(\d+)', line)
-            if m_size:
-                struct_size = int(m_size.group(1))
-                in_struct = False
-                continue
-            # field line: "   24 |   struct ucred * p_ucred"
-            m = re.match(r'\s*(\d+)\s*\|\s*(?:[\w\s\*\[\]]+\s+)?(\w+)\s*$', line)
-            if m:
-                bit_off = int(m.group(1))
-                field   = m.group(2)
-                offsets[field] = bit_off // 8
-    offsets['__sizeof__'] = struct_size
-    return offsets
 
-proc_fields  = parse_layout(dump, 'proc ')
-ucred_fields = parse_layout(dump, 'ucred ')
-fd_fields    = parse_layout(dump, 'filedesc ')
+        # Check for pointer
+        is_ptr = '*' in line
+        # Check for array
+        arr_m = re.search(r'\[(\d+)\]', line)
+        arr_count = int(arr_m.group(1)) if arr_m else 1
 
-output_lines = [
-    "=== iOS 26 / xnu-12377.121.6 Kernel Struct Offsets ===",
-    "(arm64, compiled with clang -fdump-record-layouts)",
-    ""
-]
+        # Extract field name (last word before optional [])
+        name_m = re.search(r'(\w+)\s*(?:\[\d+\])?\s*$', line)
+        if not name_m:
+            continue
+        field_name = name_m.group(1)
 
-PROC_WANT  = ['p_list','p_pid','task','p_pgrp','p_fd','p_ucred','p_csflags','p_textvp','p_ppid']
-UCRED_WANT = ['cr_ref','cr_uid','cr_svuid','cr_ruid','cr_rgid','cr_gid','cr_ngroups','cr_flags']
-FD_WANT    = ['fd_ofiles','fd_nfiles','fd_lastfile','fd_cmask']
+        if is_ptr:
+            sz, align = 8, 8
+        else:
+            # Find type
+            sz, align = 4, 4  # default
+            for tname, (tsz, talign) in TYPE_INFO.items():
+                if tname in line:
+                    sz, align = tsz, talign
+                    break
 
-if proc_fields and len(proc_fields) > 1:
-    output_lines.append("struct proc {")
-    for f in PROC_WANT:
-        if f in proc_fields:
-            output_lines.append(f"    /* 0x{proc_fields[f]:03x} */ {f};")
-    output_lines.append(f"}}; // sizeof = 0x{proc_fields.get('__sizeof__',0):x}")
-    output_lines.append("")
+        offset = align_up(offset, align)
+        offsets[field_name] = offset
+        offset += sz * arr_count
+
+    return offsets, offset
+
+# ─── Fetch and parse proc_internal.h ───────────────────────────────────────
+print("Fetching XNU headers from GitHub...")
+proc_h = fetch('bsd/sys/proc_internal.h')
+ucred_h = fetch('bsd/sys/ucred.h')
+filedesc_h = fetch('bsd/sys/filedesc.h')
+file_h = fetch('bsd/sys/file_internal.h')
+task_h = fetch('osfmk/kern/task.h')
+
+print(f"proc_internal.h: {len(proc_h)} chars")
+print(f"ucred.h: {len(ucred_h)} chars")
+print(f"filedesc.h: {len(filedesc_h)} chars")
+
+# Extract struct proc body
+def extract_struct(content, name):
+    # Find "struct name {" ... "}"
+    pattern = rf'struct\s+{name}\s*\{{([^}}]{{0,20000}})\}}'
+    m = re.search(pattern, content, re.DOTALL)
+    if m:
+        return m.group(1)
+    # Try with typedef
+    pattern2 = rf'typedef\s+struct\s+{name}\s*\{{([^}}]{{0,20000}})\}}'
+    m2 = re.search(pattern2, content, re.DOTALL)
+    if m2:
+        return m2.group(1)
+    return ''
+
+proc_body    = extract_struct(proc_h, 'proc')
+ucred_body   = extract_struct(ucred_h, 'ucred')
+filedesc_body= extract_struct(filedesc_h, 'filedesc')
+
+# Show key proc fields
+print("\n=== struct proc fields (first 50 lines) ===")
+if proc_body:
+    for i, line in enumerate(proc_body.split('\n')[:50]):
+        print(f"  {line}")
+
+# Look for key fields directly with grep
+print("\n=== Key field locations in proc_internal.h ===")
+for field in ['p_ucred', 'p_fd', 'p_pid', 'p_csflags', 'task']:
+    hits = [l.strip() for l in proc_h.split('\n') if field in l and ';' in l][:3]
+    for h in hits:
+        print(f"  {field}: {h[:80]}")
+
+print("\n=== Key field locations in ucred.h ===")
+for field in ['cr_uid', 'cr_svuid', 'cr_rgid', 'cr_gid']:
+    hits = [l.strip() for l in ucred_h.split('\n') if field in l and ';' in l][:2]
+    for h in hits:
+        print(f"  {field}: {h[:80]}")
+
+# ─── Compare with iOS 15 to find delta ─────────────────────────────────────
+print("\n=== Comparing xnu-12377 vs xnu-10002 (iOS 15) ===")
+proc_h_15 = fetch('bsd/sys/proc_internal.h', 'xnu-10002.81.5')
+proc_body_15 = extract_struct(proc_h_15, 'proc')
+print(f"proc body iOS26: {len(proc_body)} chars")
+print(f"proc body iOS15: {len(proc_body_15)} chars")
+
+# Count fields before p_ucred in each version
+def count_before(body, field):
+    lines = [l.strip() for l in body.split(';') if l.strip() and ';' not in l[:-1]]
+    count = 0
+    for l in lines:
+        if field in l:
+            break
+        if re.search(r'\w+\s*\**\s*\w+\s*(\[\d+\])?$', l):
+            count += 1
+    return count
+
+if proc_body:
+    with open('ios26_offsets.txt', 'w') as f:
+        f.write("=== iOS 26 / xnu-12377 proc struct fields ===\n")
+        f.write(proc_body[:3000])
+        f.write("\n\n=== ucred struct fields ===\n")
+        f.write(ucred_body[:1000])
+        f.write("\n\n=== filedesc struct fields ===\n")
+        f.write(filedesc_body[:1000])
+    print("\nSaved struct definitions to ios26_offsets.txt")
 else:
-    output_lines.append("struct proc: NOT PARSED")
-    output_lines.append("")
-
-if ucred_fields and len(ucred_fields) > 1:
-    output_lines.append("struct ucred {")
-    for f in UCRED_WANT:
-        if f in ucred_fields:
-            output_lines.append(f"    /* 0x{ucred_fields[f]:03x} */ {f};")
-    output_lines.append(f"}}; // sizeof = 0x{ucred_fields.get('__sizeof__',0):x}")
-    output_lines.append("")
-
-if fd_fields and len(fd_fields) > 1:
-    output_lines.append("struct filedesc {")
-    for f in FD_WANT:
-        if f in fd_fields:
-            output_lines.append(f"    /* 0x{fd_fields[f]:03x} */ {f};")
-    output_lines.append(f"}}; // sizeof = 0x{fd_fields.get('__sizeof__',0):x}")
-    output_lines.append("")
-
-if not (proc_fields and len(proc_fields) > 1):
-    output_lines.append("=== Compiler errors (first 4000 chars) ===")
-    output_lines.append(result.stderr[:4000])
-
-text = '\n'.join(output_lines)
-print(text)
-with open('ios26_offsets.txt', 'w') as f:
-    f.write(text)
-print("\nSaved ios26_offsets.txt")
+    with open('ios26_offsets.txt', 'w') as f:
+        f.write("Failed to parse - proc header first 2000 chars:\n")
+        f.write(proc_h[:2000])
+    print("Failed to parse struct")
