@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
 iOS 26 / xnu-12377 kernel struct offset extractor
-Runs on macOS with XNU source in ./xnu/
-Uses clang -ast-dump to get struct layouts without full kernel compilation
+Uses clang -Xclang -fdump-record-layouts to get struct layouts
 """
-import subprocess, sys, os, re, json
+import subprocess, sys, os, re
 
 XNU = 'xnu'
 
-# 最小化 C 文件 —— 只包含我们需要的结构体定义
 MINI_C = r"""
-/* Minimal shim to get struct layouts from XNU headers */
 #define KERNEL 1
 #define KERNEL_PRIVATE 1
 #define BSD_KERNEL_PRIVATE 1
@@ -23,128 +20,136 @@ MINI_C = r"""
 #define CONFIG_DTRACE 0
 #define MONOTONIC 0
 #define LOCK_STATS 0
-#define CONFIG_PERVASIVE_COMPACTION 0
-#define CONFIG_REQUIRES_U32_MSGID 0
-#define DEBUG 0
-#define DEVELOPMENT 0
-#define CONFIG_THREAD_GROUPS 1
 #define __arm64__ 1
 #define __LP64__ 1
+#define ARM_PGSHIFT 14
+#define CONFIG_THREAD_GROUPS 1
+#define CONFIG_PERVASIVE_COMPACTION 0
+#define CONFIG_REQUIRES_U32_MSGID 0
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
-/* We only want sizeof/offsetof - fake what we can't include */
+/* Forward declarations to satisfy missing types */
 typedef unsigned int boolean_t;
 typedef int kern_return_t;
 typedef unsigned int natural_t;
-typedef int integer_t;
 typedef uint64_t mach_vm_address_t;
 typedef uint64_t mach_vm_size_t;
 typedef unsigned int mach_port_name_t;
-typedef unsigned int mach_msg_type_number_t;
 typedef unsigned long vm_size_t;
-typedef unsigned long vm_offset_t;
 typedef uint64_t vm_map_t;
 typedef uint64_t ipc_port_t;
-typedef void* lck_mtx_t;
-typedef void* lck_rw_t;
-typedef void* lck_spin_t;
-typedef void* zone_t;
 typedef int pid_t;
 typedef unsigned int uid_t;
 typedef unsigned int gid_t;
 typedef unsigned short mode_t;
-typedef long ssize_t;
 typedef unsigned long size_t;
 typedef long long off_t;
 typedef unsigned int dev_t;
 typedef unsigned long ino_t;
-typedef unsigned long nlink_t;
-typedef unsigned int u_int;
-typedef unsigned short u_short;
-typedef unsigned char u_char;
-typedef unsigned long u_long;
 typedef uint8_t u_int8_t;
 typedef uint16_t u_int16_t;
 typedef uint32_t u_int32_t;
 typedef uint64_t u_int64_t;
-typedef int32_t int32_t;
-typedef uint32_t uint32_t;
-typedef int64_t int64_t;
+typedef unsigned int u_int;
+typedef unsigned short u_short;
+typedef unsigned char u_char;
+typedef unsigned long u_long;
 
 #include "bsd/sys/proc_internal.h"
 #include "bsd/sys/ucred.h"
+#include "bsd/sys/filedesc.h"
 
-int main(void) { return 0; }
+void dummy(void) {
+    (void)sizeof(struct proc);
+    (void)sizeof(struct ucred);
+    (void)sizeof(struct filedesc);
+}
 """
 
-out_file = f'{XNU}/mini_structs.c'
-with open(out_file, 'w') as f:
+with open(f'{XNU}/mini.c', 'w') as f:
     f.write(MINI_C)
 
-# 用 clang -fdump-record-layouts 获取结构体布局
-result = subprocess.run([
+CFLAGS = [
     'clang',
     '-target', 'arm64-apple-macos14.0',
-    f'-I{XNU}',
-    f'-I{XNU}/bsd',
-    f'-I{XNU}/osfmk',
-    f'-I{XNU}/libkern',
-    f'-I{XNU}/EXTERNAL_HEADERS',
+    f'-I{XNU}', f'-I{XNU}/bsd', f'-I{XNU}/osfmk',
+    f'-I{XNU}/libkern', f'-I{XNU}/EXTERNAL_HEADERS',
     '-DKERNEL=1', '-DKERNEL_PRIVATE=1', '-DBSD_KERNEL_PRIVATE=1',
     '-DXNU_KERNEL_PRIVATE=1', '-DMACH_KERNEL_PRIVATE=1',
     '-DPRIVATE=1', '-D__APPLE_API_PRIVATE=1',
-    '-DMACH_ASSERT=0', '-DCONFIG_DTRACE=0',
-    '-D__arm64__=1', '-D__LP64__=1',
+    '-DMACH_ASSERT=0', '-DCONFIG_DTRACE=0', '-D__arm64__=1', '-D__LP64__=1',
     '-Wno-everything',
-    '-fdump-record-layouts',
+    '-Xclang', '-fdump-record-layouts',
     '-fsyntax-only',
-    out_file
-], capture_output=True, text=True, timeout=120)
+    f'{XNU}/mini.c'
+]
 
-print("=== clang stderr (first 3000 chars) ===")
-print(result.stderr[:3000])
+result = subprocess.run(CFLAGS, capture_output=True, text=True, timeout=120)
+dump = result.stderr + result.stdout
 
-if result.returncode != 0:
-    print("FAILED - trying alternative approach...")
+# 解析 layout dump 里的偏移
+results = {}
 
-    # 备选：直接 grep XNU 头文件中的 offsetof 注释 / 已知常量
-    print("\n=== Searching XNU headers for known offset constants ===")
-    for pattern in [r'p_ucred', r'p_fd', r'bsd_info', r'fd_ofiles']:
-        r2 = subprocess.run(['grep', '-rn', pattern, f'{XNU}/bsd', f'{XNU}/osfmk'],
-                           capture_output=True, text=True)
-        hits = [l for l in r2.stdout.split('\n') if pattern in l and 'define' in l.lower()]
-        if hits:
-            print(f"\n{pattern}:")
-            for h in hits[:5]: print(f"  {h[:100]}")
-else:
-    print("Compile OK, layout dump below:")
-    print(result.stdout[:5000])
+def parse_layout(dump, struct_name):
+    """从 clang record layout dump 中提取字段偏移（bit/8 = byte）"""
+    offsets = {}
+    in_struct = False
+    for line in dump.split('\n'):
+        if f'*** Dumping AST Record Layout' in line and struct_name in line:
+            in_struct = True
+            continue
+        if in_struct:
+            if line.strip() == '':
+                in_struct = False
+                continue
+            # 格式: "  offset |   type field"
+            # 或:   "      24 |   struct proc * p_ucred"
+            m = re.match(r'\s*(\d+)\s*\|\s*\S+\s+(\w+)', line)
+            if m:
+                bit_off = int(m.group(1))
+                field   = m.group(2)
+                offsets[field] = bit_off // 8
+    return offsets
 
-# 尝试用 Python ctypes 方式
-print("\n=== Alternative: Parse struct from header directly ===")
-proc_h = f'{XNU}/bsd/sys/proc_internal.h'
-if os.path.exists(proc_h):
-    with open(proc_h) as f:
-        content = f.read()
-    # 找 struct proc { ... } 定义
-    m = re.search(r'struct proc\s*\{([^}]+(?:\{[^}]*\}[^}]*)*)\}', content, re.DOTALL)
-    if m:
-        print("Found struct proc, first 500 chars:")
-        print(m.group(1)[:500])
+proc_fields  = parse_layout(dump, 'proc')
+ucred_fields = parse_layout(dump, 'ucred')
+fd_fields    = parse_layout(dump, 'filedesc')
 
-# 用 Python ast 解析 XNU 版本号
-print("\n=== XNU Version Info ===")
-version_f = f'{XNU}/makedefs/MakeInc.def'
-if os.path.exists(version_f):
-    with open(version_f) as f:
-        for line in f:
-            if 'VERSION' in line or 'KERNEL_VERSION' in line:
-                print(f"  {line.strip()}")
+output = ["=== iOS 26 / xnu-12377 Kernel Struct Offsets ===",
+          f"(arm64, from XNU-12377.121.6 source)",
+          ""]
 
+if proc_fields:
+    output.append("struct proc:")
+    for f in ['p_list', 'p_pid', 'task', 'p_pgrp', 'p_fd', 'p_ucred', 'p_csflags', 'p_textvp']:
+        if f in proc_fields:
+            output.append(f"  offsetof(proc, {f:20}) = 0x{proc_fields[f]:03x}")
+    output.append(f"  sizeof(proc)                    = 0x{proc_fields.get('_END_',0):03x}")
+    output.append("")
+
+if ucred_fields:
+    output.append("struct ucred:")
+    for f in ['cr_ref', 'cr_uid', 'cr_svuid', 'cr_ruid', 'cr_rgid', 'cr_gid', 'cr_ngroups']:
+        if f in ucred_fields:
+            output.append(f"  offsetof(ucred, {f:20}) = 0x{ucred_fields[f]:03x}")
+    output.append("")
+
+if fd_fields:
+    output.append("struct filedesc:")
+    for f in ['fd_ofiles', 'fd_nfiles', 'fd_lastfile']:
+        if f in fd_fields:
+            output.append(f"  offsetof(filedesc, {f:20}) = 0x{fd_fields[f]:03x}")
+    output.append("")
+
+if not proc_fields and not ucred_fields:
+    output.append("WARNING: No layout data parsed. Compiler stderr:")
+    output.append(result.stderr[:3000])
+
+text = '\n'.join(output)
+print(text)
 with open('ios26_offsets.txt', 'w') as f:
-    f.write("XNU-12377 offset extraction attempt\n")
-    f.write(result.stderr[:5000])
-    f.write(result.stdout[:5000])
-print("\nSaved to ios26_offsets.txt")
+    f.write(text)
+print("\nSaved ios26_offsets.txt")
