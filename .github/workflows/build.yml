@@ -85,6 +85,7 @@ jobs:
 
       - name: Build for iOS device
         run: |
+          set -eo pipefail
           xcodebuild \
             -project H5Shell.xcodeproj \
             -scheme H5Shell \
@@ -94,8 +95,9 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY="" \
             ENABLE_BITCODE=NO \
-            clean build \
-            | xcpretty || true
+            clean build 2>&1 | tee build.log
+
+          echo "--- xcodebuild exit: $?"
 
           # Find the built .app
           APP=$(find ~/Library/Developer/Xcode/DerivedData -name "H5Shell.app" \
@@ -104,11 +106,19 @@ jobs:
             APP=$(find . -name "H5Shell.app" -path "*/Release-iphoneos/*" | head -1)
           fi
           if [ -z "$APP" ]; then
-            echo "ERROR: H5Shell.app not found after build — xcodebuild likely failed"
+            echo "ERROR: H5Shell.app not found after build"
+            echo "--- Last 50 lines of build log ---"
+            tail -50 build.log
+            exit 1
+          fi
+          # Verify the binary exists inside the app
+          if [ ! -f "$APP/H5Shell" ]; then
+            echo "ERROR: H5Shell binary missing inside $APP"
+            ls -la "$APP/"
             exit 1
           fi
           echo "APP=$APP" >> $GITHUB_ENV
-          echo "Found: $APP"
+          echo "Found: $APP (binary OK)"
 
       - name: Install ldid
         run: |
