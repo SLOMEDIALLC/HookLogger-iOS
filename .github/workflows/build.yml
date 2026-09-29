@@ -103,6 +103,10 @@ jobs:
           if [ -z "$APP" ]; then
             APP=$(find . -name "H5Shell.app" -path "*/Release-iphoneos/*" | head -1)
           fi
+          if [ -z "$APP" ]; then
+            echo "ERROR: H5Shell.app not found after build — xcodebuild likely failed"
+            exit 1
+          fi
           echo "APP=$APP" >> $GITHUB_ENV
           echo "Found: $APP"
 
@@ -114,6 +118,10 @@ jobs:
       - name: Sign and package IPA
         run: |
           APP="${{ env.APP }}"
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "ERROR: APP path is empty or missing: '$APP'"
+            exit 1
+          fi
           echo "Signing: $APP"
 
           # Sign main binary
@@ -123,6 +131,7 @@ jobs:
           rm -rf _ipa_work
           mkdir -p _ipa_work/Payload
           cp -r "$APP" _ipa_work/Payload/
+          ls -lh _ipa_work/Payload/
           cd _ipa_work
           zip -qr ../H5Shell.ipa Payload
           cd ..
