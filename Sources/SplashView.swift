@@ -74,7 +74,7 @@ struct SplashView: View {
                     .padding(.horizontal, 48)
 
                     HStack {
-                        Text(pct < 100 ? "正在加载资源..." : "加载完成")
+                        Text(pct < 100 ? "Loading resources..." : "Done")
                             .font(.system(size: 12))
                             .foregroundColor(.white.opacity(0.5))
                         Spacer()
